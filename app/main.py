@@ -27,6 +27,8 @@ from .schemas import (
     ReservationCreate,
     ReservationList,
     ReservationView,
+    SelectionPlanRequest,
+    SelectionPlanView,
     Verdict,
     BudgetView,
 )
@@ -86,7 +88,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -107,11 +109,19 @@ app = FastAPI(
         "registered datasets in one atomic, idempotent transaction: the source "
         "must stay positive and cover its current occupancy, the target may "
         "never exceed the registered cap ceiling of 1000, and a rejected "
-        "attempt leaves both caps unchanged.  Finally, a granted analysis "
-        "request can be reversed with a globally unique reversal_id and "
-        "reason: the original verdict and reservation history stay untouched "
-        "while an immutable reversal record removes the request from live RDP "
-        "composition, freeing its budget."
+        "attempt leaves both caps unchanged.  A read-only selection-plan trial "
+        "also accepts 1-12 candidate analyses (each with a unique candidate_id, "
+        "epsilon, delta and positive integer value): it enumerates every "
+        "feasible subset under the current RDP occupancy from non-reversed "
+        "granted requests and non-expired reservations, returns the "
+        "highest-value subset (ties broken by smaller projected epsilon, then "
+        "ascending candidate-id lexicographic order) with the remaining budget, "
+        "and never creates requests, reservations or verdict records -- "
+        "repeated calls recompute against the latest ledger.  Finally, a "
+        "granted analysis request can be reversed with a globally unique "
+        "reversal_id and reason: the original verdict and reservation history "
+        "stay untouched while an immutable reversal record removes the request "
+        "from live RDP composition, freeing its budget."
     ),
 )
 
@@ -354,6 +364,18 @@ async def get_release_forecast(
 async def submit_request(dataset_id: DATASET_ID, payload: AnalysisRequest):
     verdict, http_status = await ledger.submit_analysis(dataset_id, payload)
     return JSONResponse(status_code=http_status, content=verdict)
+
+
+@app.post(
+    "/datasets/{dataset_id}/selection-plans",
+    response_model=SelectionPlanView,
+    tags=["selection-plans"],
+    summary="Trial the best feasible subset of candidates (read-only)",
+)
+async def create_selection_plan(
+    dataset_id: DATASET_ID, payload: SelectionPlanRequest
+) -> dict:
+    return await ledger.selection_plan(dataset_id, payload.candidates)
 
 
 @app.get(

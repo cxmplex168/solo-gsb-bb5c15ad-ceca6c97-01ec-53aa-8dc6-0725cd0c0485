@@ -18,6 +18,7 @@ from .schemas import (
     ReversalCreate,
     ReservationConfirm,
     ReservationCreate,
+    SelectionPlanCandidate,
     utcnow,
 )
 
@@ -1132,6 +1133,143 @@ async def release_forecast(
         "initial": _forecast_snapshot_view(initial),
         "events": events,
         "at_deadline": _forecast_snapshot_view(at_deadline),
+    }
+
+
+# -------------------------------------------------------- selection plans --
+
+
+async def selection_plan(
+    dataset_id: str, candidates: list[SelectionPlanCandidate]
+) -> dict[str, Any]:
+    """Read-only trial: pick the feasible candidate subset with best value.
+
+    The current ledger occupancy is computed with the exact same RDP
+    accounting as admission checks -- granted, non-reversed requests plus
+    granted reservations that have not expired *right now* -- but, like the
+    release forecast, this path issues pure SELECTs only: it never runs the
+    lazy expiry sweep and creates no request, reservation, batch, reversal or
+    any other record.  Every call therefore recomputes against the latest
+    committed ledger state.
+
+    Every subset of the 1-12 candidates is enumerated (at most 4096) and each
+    feasible subset (projected epsilon <= cap + tolerance) competes by:
+
+    1. maximum total ``value``;
+    2. then the smaller composed projected epsilon;
+    3. then the smaller candidate-id list in ascending lexicographic order.
+    """
+    now = utcnow()
+    now_iso = now.isoformat()
+
+    async with db.connect() as conn:
+        dataset = await db.require_dataset(conn, dataset_id)
+        # Pure SELECTs only (no lazy expiry UPDATE), so the trial is strictly
+        # read-only; reservations past their TTL simply do not qualify.
+        granted = await db.list_granted_entries(conn, dataset_id)
+        reservation_rows = await db.list_granted_reservation_rows(
+            conn, dataset_id, now_iso=now_iso
+        )
+        assert not conn.in_transaction
+
+    cap = dataset["epsilon_cap"]
+    target_delta = dataset["delta_cap"]
+
+    # Decompose the committed occupancy once so each subset projection is a
+    # cheap per-order sum instead of recomposing the whole ledger 2**n times.
+    committed_entries: list[tuple[float, float]] = granted + [
+        (row["epsilon"], row["delta"]) for row in reservation_rows
+    ]
+    _, committed, _ = rdp.evaluate_entries(
+        committed_entries, target_delta
+    )
+    committed = max(0.0, committed)
+
+    base_pure = sum(eps for eps, d in committed_entries if d == 0.0)
+    base_approx_curve = rdp.compose_rdp(
+        [
+            rdp.single_rdp_curve(eps, d)
+            for eps, d in committed_entries
+            if d > 0.0
+        ]
+    )
+    has_approx = any(d > 0.0 for _, d in committed_entries)
+
+    # Per-candidate contributions: a flat pure-DP offset and an RDP curve for
+    # approximate-DP candidates.
+    cand_pure = [
+        c.epsilon if c.delta == 0.0 else 0.0 for c in candidates
+    ]
+    cand_curves = [
+        rdp.single_rdp_curve(c.epsilon, c.delta) if c.delta > 0.0 else None
+        for c in candidates
+    ]
+    cand_ids = [c.candidate_id for c in candidates]
+    cand_values = [c.value for c in candidates]
+
+    def _project(indices: tuple[int, ...]) -> tuple[float, float]:
+        """Composed (epsilon, best_order) if these candidates were granted."""
+        pure_sum = base_pure + sum(cand_pure[i] for i in indices)
+        approx_here = has_approx or any(
+            cand_curves[i] is not None for i in indices
+        )
+        if not approx_here:
+            if pure_sum == 0.0:
+                # Mirror evaluate_entries([]): no mechanisms at all.
+                return 0.0, rdp.RDP_ORDERS[-1]
+            # Exact pure-DP basic composition.
+            return pure_sum, rdp.RDP_ORDERS[0]
+        composed = [*base_approx_curve]
+        for i in indices:
+            curve = cand_curves[i]
+            if curve is not None:
+                for j, part in enumerate(curve):
+                    composed[j] += part
+        epsilon, order = rdp.rdp_to_approx_dp(composed, target_delta)
+        return max(0.0, pure_sum + epsilon), order
+
+    # The empty subset is always feasible; selection starts there.
+    best_indices: tuple[int, ...] = ()
+    best_value = 0
+    best_epsilon, best_order = _project(())
+    for mask in range(1, 1 << len(candidates)):
+        indices = tuple(i for i in range(len(candidates)) if mask & (1 << i))
+        projected, order = _project(indices)
+        if projected > cap + settings.epsilon_tolerance:
+            continue
+        total_value = sum(cand_values[i] for i in indices)
+        key_ids = sorted(cand_ids[i] for i in indices)
+        if (
+            total_value > best_value
+            or (
+                total_value == best_value
+                and projected < best_epsilon - settings.epsilon_tolerance
+            )
+            or (
+                total_value == best_value
+                and abs(projected - best_epsilon) <= settings.epsilon_tolerance
+                and key_ids < sorted(cand_ids[i] for i in best_indices)
+            )
+        ):
+            best_indices = indices
+            best_value = total_value
+            best_epsilon, best_order = projected, order
+
+    selected = sorted(cand_ids[i] for i in best_indices)
+    selected_set = set(selected)
+    unselected = [cid for cid in cand_ids if cid not in selected_set]
+    return {
+        "dataset_id": dataset_id,
+        "generated_at": now,
+        "candidate_count": len(candidates),
+        "selected_candidate_ids": selected,
+        "unselected_candidate_ids": unselected,
+        "total_value": best_value,
+        "epsilon_cap": cap,
+        "epsilon_committed": committed,
+        "projected_epsilon": best_epsilon,
+        "epsilon_remaining": max(0.0, cap - best_epsilon),
+        "rdp_best_order": best_order,
     }
 
 

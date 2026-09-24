@@ -50,6 +50,17 @@ delta_cap 与已入账申请、预留均不变。来源转出后上限必须仍�
 `reversal_id` + 相同目标与原因重试返回原冲正记录（不重复释放），异负载
 `409`；原 `request_id` 同负载重试仍回放最初裁定、不重新占额。
 
+另外提供**只读的候选组合试算（selection plan）**：
+`POST /datasets/{dataset_id}/selection-plans` 一次提交 **1～12 个**候选分析项
+（每项含请求内唯一的 `candidate_id`、`epsilon`、`delta` 与正整数 `value`），
+服务按**当前账本**——全部未冲正已授权申请与全部未到期有效预留——用既有 RDP
+口径**穷举所有可行子集**（至多 2¹² = 4096 个），选出总 `value` 最大的组合；
+总 value 相同时取**组合投影 epsilon 更小**者，再相同则按 `candidate_id`
+升序列表的字典序裁定。响应返回选中 ID、总 value、组合投影 epsilon、剩余额度
+与未选中 ID；没有任何非空子集可行时返回空组合，占用字段即当前账本占用。
+试算**严格只读**：不创建申请、预留或任何裁定记录，也不触发预留惰性清扫；
+重复调用始终按最新账本重新计算。
+
 ---
 
 ## 1. 快速启动（Docker Compose）
@@ -144,6 +155,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/datasets/{dataset_id}/budget` | 仅预算明细（消耗 / 预留 / 剩余 / RDP 曲线） |
 | `POST` | `/datasets/{dataset_id}/requests` | 提交分析申请（幂等） |
 | `GET` | `/datasets/{dataset_id}/requests` | 全部申请记录（含 granted / rejected，并标明是否已冲正） |
+| `POST` | `/datasets/{dataset_id}/selection-plans` | **只读**试算：穷举 1～12 个候选的可行子集，返回总 value 最大的组合（不落库） |
 | `POST` | `/datasets/{dataset_id}/request-batches` | 原子提交 2～20 项分析批次（整批批准或整批拒绝，按 `batch_id` 幂等） |
 | `GET` | `/datasets/{dataset_id}/request-batches/{batch_id}` | 按 `batch_id` 查询批次裁定与各项当时的组合值 |
 | `POST` | `/datasets/{dataset_id}/requests/{request_id}/reversals` | 冲正一条已授权且未冲正的申请（按 `reversal_id` 幂等） |
@@ -759,6 +771,93 @@ curl -X POST \
   `reversal_reason`、`reversed_at` 字段；未冲正的申请这些字段为
   `false` / `null`，原裁定字段保持为受理当时的历史值。
 
+### 4.15 候选组合试算（selection plan，只读）
+
+在**不创建任何申请 / 预留 / 裁定记录**的前提下，对 1～12 个候选分析项穷举
+可行子集，返回当前账本下总 `value` 最大的组合。占用基线与正式准入完全一致：
+全部 **granted 且未冲正**的申请+全部**未到期** granted 预留（已释放 / 已确认 /
+已过期 / 被拒绝的预留不参与）。
+
+```bash
+curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "candidates": [
+      {"candidate_id": "cand-20260924-0001", "epsilon": 0.1, "delta": 1e-8, "value": 10},
+      {"candidate_id": "cand-20260924-0002", "epsilon": 0.2, "delta": 1e-8, "value": 25},
+      {"candidate_id": "cand-20260924-0003", "epsilon": 0.05, "delta": 0.0, "value": 7}
+    ]
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `candidates` | array | 必填，**1～12 项** |
+| `candidates[].candidate_id` | string | 必填，1–200 字符，**同一次请求内唯一** |
+| `candidates[].epsilon` | float | `> 0, ≤ 1000`，候选分析的 epsilon |
+| `candidates[].delta` | float | `>= 0, < 1`；`0` 表示纯 ε-DP |
+| `candidates[].value` | integer | 必填，**正整数**（`≥ 1`），组合要最大化的收益 |
+
+服务对每个子集把其各项与当前占用一次性做 RDP 联合组合（与批次同一张 orders
+网格、同一浮点容差），投影 epsilon `≤ epsilon_cap + EPSILON_TOLERANCE` 视为可行；
+空集恒可行。在全部可行子集中按以下顺序裁定：
+
+1. **总 `value` 最大**（各项 `value` 之和）；
+2. 总 value 相同 → **组合投影 epsilon 更小**；
+3. 仍相同 → 按 **`candidate_id` 升序列表的字典序**取更小者。
+
+成功返回 `200`：
+
+```json
+{
+  "dataset_id": "sales-2026",
+  "generated_at": "2026-09-24T10:00:00.000000Z",
+  "candidate_count": 3,
+  "selected_candidate_ids": [
+    "cand-20260924-0001",
+    "cand-20260924-0002",
+    "cand-20260924-0003"
+  ],
+  "unselected_candidate_ids": [],
+  "total_value": 42,
+  "epsilon_cap": 1.0,
+  "epsilon_committed": 0.0,
+  "projected_epsilon": 0.3612,
+  "epsilon_remaining": 0.6388,
+  "rdp_best_order": 8192.0
+}
+```
+
+字段说明：
+
+* `selected_candidate_ids` / `unselected_candidate_ids`：选中 / 未选中候选 ID，
+  **均按 `candidate_id` 升序输出**；
+* `total_value`：选中子集的 `value` 之和（空组合为 `0`）；
+* `epsilon_committed`：试算时刻「未冲正已授权申请 + 未到期有效预留」的组合
+  epsilon（与预算视图口径一致）；
+* `projected_epsilon`：当前占用**再叠加选中子集各项**后的组合投影 epsilon
+  （空组合即 `epsilon_committed`）；`rdp_best_order` 为取得该投影的最优 RDP order；
+* `epsilon_remaining`：`epsilon_cap − projected_epsilon`（不为负）。
+
+**没有任何非空子集可行**时，`selected_candidate_ids` 为 `[]`、
+`total_value = 0`、`projected_epsilon = epsilon_committed`，全部候选出现在
+`unselected_candidate_ids` 中。
+
+语义与边界：
+
+* **严格只读、无幂等键**：本接口不写任何表（不产生申请、预留、批次、转拨或
+  冲正记录），也**不触发预留惰性清扫**（与 release-forecast 同为纯 SELECT）；
+  因此没有 `idempotent_replay` 字段，**每次调用都按最新账本重算**——账本被
+  其他申请 / 预留 / 冲正 / 转拨改变后，再次试算可能得到不同组合；
+* 候选仅在试算内参与组合，不锁定任何额度，也不占用任何 `request_id` /
+  `reservation_id` 命名空间；试算结束后客户端仍需通过普通申请 / 批次 / 预留
+  接口正式提交（正式提交时按当时账本重新准入，试算结果不构成承诺）；
+* 数据集不存在 → `404 dataset_not_found`；
+* 候选数为 0 或超过 12、`candidate_id` 重复或为空、`epsilon` / `delta` 越界、
+  `value` 非正整数（含小数）等 → `422`。
+
 ---
 
 ## 5. RDP 组合会计（核算口径）
@@ -798,6 +897,12 @@ curl -X POST \
    原申请的历史 `epsilon_before` / `epsilon_after` 不被改写。批次裁定
    （含各项当时的累计快照）同样是**历史记录**：即使批次内某项事后被冲正，
    按 `batch_id` 重放 / 查询仍返回首次裁定与当时的组合值。
+
+7. 试算（selection plan）**不改变上述任何集合**：它对 1～12 个候选穷举全部
+   2ⁿ 个子集，每个子集与「未冲正已授权申请 ∪ 未到期预留」的当前组合曲线做
+   **同一条** RDP 投影（纯 ε-DP 仍走精确可加分支），仅保留投影不超 cap 的
+   可行子集并按「总 value → 投影 epsilon → 候选 ID 升序列表字典序」选优；
+   全程纯 SELECT，不落任何记录、不做惰性清扫，重复调用按最新账本重算。
 
 特殊情形：
 
@@ -845,6 +950,9 @@ curl -X POST \
   “先到先得、额满即拒”；
 * TTL 过期为**惰性**处理：任何读写路径进入临界区时先把到期预留标记为
   `expired` 再计算额度，因此过期预留既不会继续占额，也不会被重复确认。
+* 只读的候选组合试算（selection plan）与释放预测一样**不进入写临界区、不开启
+  写事务**：仅用纯 SELECT 读取未冲正申请与未到期预留后在进程内穷举子集，
+  与任何并发写互不阻塞，也绝不改变数据库状态。
 
 ---
 
@@ -920,6 +1028,15 @@ confirmed、其他有效预留继续计入并仍能阻止超额新申请、到�
 数据集 / 批次 404、30 个批次并发不透支且被拒批次零残留、20 路重复
 `batch_id` 并发仅一条记录、15 路共享 `request_id` 的批次并发仅一批成功，
 以及从 v4 schema 启动时自动迁移出批次两张表。
+
+候选组合试算测试另覆盖：空数据集全选、按总 value 而非项数 / epsilon 选优、
+纯 ε-DP 背包组合、value 同分取更小投影 epsilon、value 与 epsilon 都同分按
+候选 ID 升序列表字典序裁定、无可行非空子集时返回空组合与当前占用、当前已授权
+申请与有效预留计入基线（并用 `rdp.py` 独立穷举交叉校验投影与选择结果）、已过期
+预留与已冲正申请不参与、严格只读（不产生申请 / 预留 / 冲正记录、不触发惰性
+清扫、重复调用结果稳定）、账本变化后再次试算按最新占用重算、12 项边界、缺失
+数据集 404、0 / 13 项、重复 `candidate_id`、`value` 非正整数（含小数）与
+epsilon/delta 越界 422。
 
 ---
 

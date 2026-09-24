@@ -561,5 +561,93 @@ class BudgetTransferView(BaseModel):
     created_at: datetime
 
 
+# ----------------------------------------------------------- selection plans --
+
+
+# A read-only selection trial enumerates every subset, so the candidate count
+# is capped tightly (2**12 = 4096 subsets at most).
+MIN_SELECTION_CANDIDATES = 1
+MAX_SELECTION_CANDIDATES = 12
+
+
+class SelectionPlanCandidate(BaseModel):
+    """One candidate analysis item for a read-only selection trial."""
+
+    candidate_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["cand-20260924-0001"],
+        description="Client-chosen identifier; unique within one request.",
+    )
+    epsilon: float = Field(..., gt=0.0, le=1_000.0, examples=[0.1])
+    delta: float = Field(
+        ...,
+        ge=0.0,
+        lt=1.0,
+        examples=[1e-7],
+        description="Candidate delta; use 0 for pure epsilon-DP.",
+    )
+    value: int = Field(
+        ...,
+        ge=1,
+        examples=[10],
+        description="Positive integer payoff maximised by the chosen subset.",
+    )
+
+    _eps_finite = _finite("epsilon")
+    _delta_finite = _finite("delta")
+
+
+class SelectionPlanRequest(BaseModel):
+    """1-12 candidate items for a read-only feasible-subset trial."""
+
+    candidates: list[SelectionPlanCandidate] = Field(
+        ...,
+        min_length=MIN_SELECTION_CANDIDATES,
+        max_length=MAX_SELECTION_CANDIDATES,
+    )
+
+    @model_validator(mode="after")
+    def _unique_candidate_ids(self) -> "SelectionPlanRequest":
+        seen: set[str] = set()
+        for candidate in self.candidates:
+            if candidate.candidate_id in seen:
+                raise ValueError(
+                    f"candidate_id {candidate.candidate_id!r} occurs more than "
+                    "once; candidate_id must be unique within the request"
+                )
+            seen.add(candidate.candidate_id)
+        return self
+
+
+class SelectionPlanView(BaseModel):
+    """Result of a read-only best-subset selection trial.
+
+    Nothing is persisted: no analysis request, reservation or verdict record
+    is ever created, and every call recomputes against the current ledger
+    (granted non-reversed requests plus non-expired granted reservations).
+    When no non-empty subset fits, the selection is empty and the occupancy
+    fields simply describe the current ledger.
+    """
+
+    dataset_id: str
+    generated_at: datetime
+    candidate_count: int
+    # Chosen / skipped candidates, each sorted by candidate_id ascending.
+    selected_candidate_ids: list[str]
+    unselected_candidate_ids: list[str]
+    # Sum of the chosen candidates' values.
+    total_value: int
+    epsilon_cap: float
+    # Composed epsilon currently occupied before any candidate is added.
+    epsilon_committed: float
+    # Composed epsilon projected for committed entries + the chosen subset.
+    projected_epsilon: float
+    # cap - projected_epsilon, floored at zero like the live budget views.
+    epsilon_remaining: float
+    rdp_best_order: float
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
