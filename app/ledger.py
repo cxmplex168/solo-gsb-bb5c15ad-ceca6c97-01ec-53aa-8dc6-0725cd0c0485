@@ -18,6 +18,7 @@ from .schemas import (
     ReversalCreate,
     ReservationConfirm,
     ReservationCreate,
+    SelectionPlanRequest,
     utcnow,
 )
 
@@ -1132,6 +1133,95 @@ async def release_forecast(
         "initial": _forecast_snapshot_view(initial),
         "events": events,
         "at_deadline": _forecast_snapshot_view(at_deadline),
+    }
+
+
+# ---------------------------------------------------------- selection plans --
+
+
+async def plan_selection(
+    dataset_id: str, payload: SelectionPlanRequest
+) -> dict[str, Any]:
+    """Read-only what-if: pick the maximum-value feasible candidate subset.
+
+    Every candidate subset is composed together with the live ledger entries
+    (granted non-reversed requests plus non-expired granted reservations)
+    under the exact same RDP accounting as admission; a subset is feasible
+    when the joint projection stays within ``epsilon_cap``.  Among feasible
+    subsets the plan picks the largest total ``value``, breaking ties by the
+    smaller projected epsilon and then by the lexicographically smaller
+    ascending-sorted ``candidate_id`` list.  When no candidate fits, the
+    empty selection is returned together with the current occupancy.
+
+    The simulation never writes: like the release forecast it uses pure
+    SELECTs (no lazy expiry sweep, no request/reservation/verdict rows), so
+    repeated calls simply recompute against the latest ledger state.
+    """
+    now = utcnow()
+    now_iso = now.isoformat()
+
+    async with db.connect() as conn:
+        dataset = await db.require_dataset(conn, dataset_id)
+        # Pure SELECTs only: list_granted_reservation_rows performs no expiry
+        # UPDATE, so this simulation cannot mutate the database.
+        granted = await db.list_granted_entries(conn, dataset_id)
+        rows = await db.list_granted_reservation_rows(
+            conn, dataset_id, now_iso=now_iso
+        )
+        assert not conn.in_transaction
+
+    committed_entries = granted + [
+        (row["epsilon"], row["delta"]) for row in rows
+    ]
+    cap = dataset["epsilon_cap"]
+    target_delta = dataset["delta_cap"]
+
+    candidates = payload.candidates
+    n = len(candidates)
+    projector = rdp.SubsetProjector(
+        committed_entries,
+        [(c.epsilon, c.delta) for c in candidates],
+        target_delta,
+    )
+
+    committed_eps, _ = projector.evaluate([])
+
+    # Exhaustive enumeration of all 2**n subsets (n <= 12).  The empty subset
+    # is always feasible, so a best plan always exists.
+    best_ids: list[str] = []
+    best_value = 0
+    best_eps = committed_eps
+    best_order = rdp.RDP_ORDERS[-1]
+    best_key: Optional[tuple[int, float, list[str]]] = None
+    for mask in range(1 << n):
+        indices = [i for i in range(n) if mask & (1 << i)]
+        eps, order = projector.evaluate(indices)
+        if eps > cap + settings.epsilon_tolerance:
+            continue
+        ids = sorted(candidates[i].candidate_id for i in indices)
+        value = sum(candidates[i].value for i in indices)
+        # Maximise value, then minimise projected epsilon, then take the
+        # lexicographically smallest ascending id list.
+        key = (-value, eps, ids)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_ids, best_value, best_eps, best_order = ids, value, eps, order
+
+    selected = set(best_ids)
+    return {
+        "dataset_id": dataset_id,
+        "epsilon_cap": cap,
+        "epsilon_committed": max(0.0, committed_eps),
+        "candidate_count": n,
+        "selected_candidate_ids": best_ids,
+        "unselected_candidate_ids": sorted(
+            c.candidate_id for c in candidates if c.candidate_id not in selected
+        ),
+        "total_value": best_value,
+        "projected_epsilon": max(0.0, best_eps),
+        "epsilon_remaining": max(0.0, cap - best_eps),
+        "rdp_best_order": best_order,
+        "generated_at": now,
     }
 
 

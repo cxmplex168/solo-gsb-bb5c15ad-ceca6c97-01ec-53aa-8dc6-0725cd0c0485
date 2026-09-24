@@ -27,6 +27,8 @@ from .schemas import (
     ReservationCreate,
     ReservationList,
     ReservationView,
+    SelectionPlan,
+    SelectionPlanRequest,
     Verdict,
     BudgetView,
 )
@@ -111,7 +113,13 @@ app = FastAPI(
         "request can be reversed with a globally unique reversal_id and "
         "reason: the original verdict and reservation history stay untouched "
         "while an immutable reversal record removes the request from live RDP "
-        "composition, freeing its budget."
+        "composition, freeing its budget.  A read-only selection-plan "
+        "endpoint additionally simulates, for 1-12 candidate analyses each "
+        "carrying a positive integer value, which feasible subset maximises "
+        "the total value under the same RDP accounting (ties broken by "
+        "smaller projected epsilon, then by the ascending candidate_id "
+        "list); the simulation writes nothing and is recomputed from the "
+        "live ledger on every call."
     ),
 )
 
@@ -344,6 +352,18 @@ async def get_release_forecast(
     ],
 ) -> dict:
     return await ledger.release_forecast(dataset_id, deadline)
+
+
+@app.post(
+    "/datasets/{dataset_id}/selection-plans",
+    response_model=SelectionPlan,
+    tags=["selection-plans"],
+    summary="Read-only what-if: pick the max-value feasible candidate subset",
+)
+async def create_selection_plan(
+    dataset_id: DATASET_ID, payload: SelectionPlanRequest
+) -> dict:
+    return await ledger.plan_selection(dataset_id, payload)
 
 
 @app.post(

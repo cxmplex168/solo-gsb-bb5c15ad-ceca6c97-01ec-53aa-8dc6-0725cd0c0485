@@ -213,6 +213,104 @@ class BudgetView(BaseModel):
     rdp_curve: dict[str, float]
 
 
+# -------------------------------------------------------- selection plans --
+
+
+# A selection plan carries between 1 and 12 candidate analyses; with 12
+# candidates the exhaustive search evaluates 2**12 = 4096 subsets.
+MIN_SELECTION_CANDIDATES = 1
+MAX_SELECTION_CANDIDATES = 12
+
+
+class SelectionCandidate(BaseModel):
+    """One candidate analysis in a selection-plan what-if request."""
+
+    candidate_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["cand-001"],
+        description="Client-chosen candidate label; unique within the "
+        "request.  Never persisted.",
+    )
+    epsilon: float = Field(..., gt=0.0, le=1_000.0, examples=[0.1])
+    delta: float = Field(
+        ...,
+        ge=0.0,
+        lt=1.0,
+        examples=[1e-7],
+        description="Per-candidate delta; use 0 for pure epsilon-DP.",
+    )
+    value: int = Field(
+        ...,
+        ge=1,
+        examples=[3],
+        description="Positive integer utility of running this analysis; the "
+        "plan maximises the total value of the selected subset.",
+    )
+
+    _eps_finite = _finite("epsilon")
+    _delta_finite = _finite("delta")
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _valid_candidate_id(cls, v: str) -> str:
+        if not _DATASET_ID_PATTERN.fullmatch(v):
+            raise ValueError(
+                "may contain only letters, digits, '.', '_' and '-'"
+            )
+        return v
+
+
+class SelectionPlanRequest(BaseModel):
+    """A read-only what-if query: pick the best feasible candidate subset."""
+
+    candidates: list[SelectionCandidate] = Field(
+        ...,
+        min_length=MIN_SELECTION_CANDIDATES,
+        max_length=MAX_SELECTION_CANDIDATES,
+    )
+
+    @model_validator(mode="after")
+    def _unique_candidate_ids(self) -> "SelectionPlanRequest":
+        seen: set[str] = set()
+        for candidate in self.candidates:
+            if candidate.candidate_id in seen:
+                raise ValueError(
+                    "candidate_id occurs more than once: "
+                    f"{candidate.candidate_id!r}"
+                )
+            seen.add(candidate.candidate_id)
+        return self
+
+
+class SelectionPlan(BaseModel):
+    """Result of a read-only selection-plan simulation.
+
+    ``selected_candidate_ids`` is the feasible subset with the largest total
+    ``value``; ties are broken by the smaller composed projected epsilon, then
+    by the lexicographically smaller ascending-sorted id list.  Nothing is
+    persisted: the plan is recomputed from the live ledger on every call.
+    """
+
+    dataset_id: str
+    epsilon_cap: float
+    # Composed epsilon of the current ledger (granted non-reversed requests +
+    # non-expired granted reservations) before selecting anything.
+    epsilon_committed: float
+    candidate_count: int
+    selected_candidate_ids: list[str]
+    unselected_candidate_ids: list[str]
+    total_value: int
+    # Composed epsilon of the ledger entries together with the selected
+    # subset (equals epsilon_committed when the selection is empty).
+    projected_epsilon: float
+    # epsilon_cap - projected_epsilon, floored at 0.
+    epsilon_remaining: float
+    rdp_best_order: float
+    generated_at: datetime
+
+
 class DatasetInfo(BaseModel):
     dataset_id: str
     description: Optional[str]

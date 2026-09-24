@@ -143,6 +143,63 @@ def project_entries(
     return epsilon, order
 
 
+class SubsetProjector:
+    """Project composed (epsilon, best_order) for many candidate subsets.
+
+    The committed base (granted non-reversed requests plus non-expired granted
+    reservations) and every candidate's RDP curve are precomputed once, so
+    enumerating all ``2 ** n`` candidate subsets stays cheap.  The accounting
+    is exactly :func:`evaluate_entries`: pure epsilon-DP mechanisms contribute
+    an exact constant offset, approximate-DP mechanisms are summed on the RDP
+    grid and converted back at ``target_delta``; an all-pure composition is
+    the exact basic-composition sum with no conversion slack.
+    """
+
+    def __init__(
+        self,
+        base_entries: list[tuple[float, float]],
+        candidate_entries: list[tuple[float, float]],
+        target_delta: float,
+    ) -> None:
+        self._target_delta = target_delta
+        self._has_base = bool(base_entries)
+        self._base_pure = sum(eps for eps, d in base_entries if d == 0.0)
+        self._base_approx = compose_rdp(
+            [single_rdp_curve(eps, d) for eps, d in base_entries if d > 0.0]
+        )
+        self._base_has_approx = any(d > 0.0 for _, d in base_entries)
+        self._cand_pure = [
+            eps if d == 0.0 else 0.0 for eps, d in candidate_entries
+        ]
+        self._cand_approx = [
+            single_rdp_curve(eps, d) if d > 0.0 else None
+            for eps, d in candidate_entries
+        ]
+
+    def evaluate(self, indices: list[int]) -> tuple[float, float]:
+        """Composed (epsilon, best_order) of the base plus the chosen subset."""
+        pure = self._base_pure
+        curve = self._base_approx
+        has_approx = self._base_has_approx
+        for i in indices:
+            pure += self._cand_pure[i]
+            approx = self._cand_approx[i]
+            if approx is not None:
+                has_approx = True
+                curve = [a + b for a, b in zip(curve, approx)]
+        if not has_approx:
+            if not self._has_base and not indices:
+                # No mechanisms at all: the empty-composition convention of
+                # evaluate_entries.
+                return 0.0, RDP_ORDERS[-1]
+            # Exact pure-DP basic composition.
+            return pure, RDP_ORDERS[0]
+        epsilon, order = rdp_to_approx_dp(
+            [pure + part for part in curve], self._target_delta
+        )
+        return max(0.0, epsilon), order
+
+
 def sample_curve(rdp: list[float]) -> dict[str, float]:
     """Pick a representative subset of (order -> epsilon) for API responses."""
     out: dict[str, float] = {}
